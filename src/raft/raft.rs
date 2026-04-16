@@ -14,7 +14,18 @@ use std::{
 
 #[derive(Clone)]
 pub struct RaftHandle {
+    peers: Vec<SocketAddr>,
     inner: Arc<Mutex<Raft>>,
+    me: usize,
+    num_peers: usize,
+    num_half_vote: usize,
+}
+
+#[derive(Debug)]
+enum VoteResult {
+    Granted,
+    Denied,
+    HigherTerm(u64),
 }
 
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
@@ -62,14 +73,10 @@ struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
-    state: State,
-}
-
-/// State of a raft peer.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-struct State {
-    term: u64,
     role: Role,
+    current_term: u64,
+    received_valid_rpc: bool,
+    voted_for: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,12 +89,6 @@ enum Role {
 impl Default for Role {
     fn default() -> Self {
         Role::Follower
-    }
-}
-
-impl State {
-    fn is_leader(&self) -> bool {
-        matches!(self.role, Role::Leader)
     }
 }
 
@@ -107,16 +108,26 @@ impl fmt::Debug for Raft {
 impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let (apply_ch, recver) = mpsc::unbounded();
+        let num_peers = peers.len();
         let inner = Arc::new(Mutex::new(Raft {
-            peers,
+            peers: peers.clone(),
             me,
             apply_ch,
-            state: State::default(),
+            role: Role::Follower,
+            current_term: 0,
+            received_valid_rpc: false,
+            voted_for: None,
         }));
-        let handle = RaftHandle { inner };
+        let handle = RaftHandle {peers, inner, me, num_peers, num_half_vote: (num_peers + 1) / 2 };
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
         handle.start_rpc_server();
+
+        let handle_clone = handle.clone();
+        task::spawn( async move {
+            background(handle_clone).await;
+        }).detach();
+
 
         (handle, recver)
     }
@@ -136,14 +147,12 @@ impl RaftHandle {
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        let raft = self.inner.lock().unwrap();
-        raft.state.term
+        self.inner.lock().unwrap().current_term
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        let raft = self.inner.lock().unwrap();
-        raft.state.is_leader()
+        self.inner.lock().unwrap().role == Role::Leader
     }
 
     /// A service wants to switch to snapshot.  
@@ -218,7 +227,12 @@ impl RaftHandle {
             let this = this.clone();
             async move { this.request_vote(args).await.unwrap() }
         });
-        // add more RPC handers here
+        // add more RPC handlers here
+        let this = self.clone();
+        net.add_rpc_handler(move |args: AppendEntriesArgs| {
+            let this = this.clone();
+            async move { this.append_entries(args).await.unwrap() }
+        })
     }
 
     async fn request_vote(&self, args: RequestVoteArgs) -> Result<RequestVoteReply> {
@@ -228,19 +242,206 @@ impl RaftHandle {
         };
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
-        self.persist().await.expect("failed to persist");
+        // self.persist().await.expect("failed to persist");
+        Ok(reply)
+    }
+
+    async fn append_entries(&self, args: AppendEntriesArgs) -> Result<AppendEntriesReply> {
+        let reply = {
+            let mut this = self.inner.lock().unwrap();
+            this.append_entries(args)
+        };
         Ok(reply)
     }
 }
 
+async fn background(rf_handle: RaftHandle) {
+    loop {
+        let role= {
+            rf_handle.inner.lock().unwrap().role
+        };
+
+        match role {
+            Role::Follower => {follower_task(rf_handle.clone(), Role::Follower).await},
+            Role::Candidate => {follower_task(rf_handle.clone(), Role::Candidate).await},
+            Role::Leader => {leader_task(rf_handle.clone()).await},
+        }
+    }
+}
+
+async fn leader_task(rf_handle: RaftHandle) {
+    sleep(Duration::from_millis(150)).await;
+    let mut rf = rf_handle.inner.lock().unwrap();
+    if rf.received_valid_rpc {
+        rf.received_valid_rpc = false;
+        rf.role = Role::Follower;
+        return;
+    }
+    if rf.role != Role::Leader {
+        return;
+    }
+    send_heartbeat(rf_handle.clone(), rf.current_term);
+}
+
+async fn follower_task(rf_handle: RaftHandle, initial_role: Role) {
+    sleep(Duration::from_millis(rand::rng().gen_range(450..900))).await;
+    let mut rx = {
+        let mut rf = rf_handle.inner.lock().unwrap();
+        if rf.received_valid_rpc {
+            rf.received_valid_rpc = false;
+            rf.role = Role::Follower;
+            return;
+        }
+        if rf.role != initial_role {
+            return;
+        }
+        rf.role = Role::Candidate;
+        rf.current_term += 1;
+        rf.voted_for = Some(rf.me);
+        let term = rf.current_term;
+        info!("[{term}] peer {0} begin election", rf_handle.me);
+        begin_election(rf_handle.clone(), term, 0, 0)
+    };
+
+    let mut num_granted = 1;
+    let mut num_voted = 1;
+    while let Some(result) = rx.next().await {
+        let mut rf = rf_handle.inner.lock().unwrap();
+        match result {
+            VoteResult::HigherTerm(term) => {
+                num_granted = 0;
+                num_voted = rf_handle.num_peers;
+                rf.role = Role::Follower;
+                if term > rf.current_term {
+                    rf.current_term = term;
+                    rf.voted_for = None;
+                }
+            }
+            VoteResult::Granted => {
+                num_granted += 1;
+                num_voted += 1;
+            }
+            VoteResult::Denied => {
+                num_voted += 1;
+            }
+        }
+        if rf.received_valid_rpc {
+            rf.received_valid_rpc = false;
+            rf.role = Role::Follower;
+            return;
+        }
+        if rf.role != Role::Candidate {
+            return;
+        }
+        if num_granted >= rf_handle.num_half_vote {
+            info!("[{}] peer {} becomes leader", rf.current_term, rf.me);
+            rf.role = Role::Leader;
+            send_heartbeat(rf_handle.clone(), rf.current_term);
+            return;
+        }
+        if num_voted >= rf_handle.num_peers {
+            return
+        }
+    }
+}
+
+fn begin_election(rf_handle: RaftHandle, term: u64, last_log_index: u64, last_log_term: u64)
+    -> mpsc::Receiver<VoteResult> {
+    let (tx, rx) = mpsc::channel(rf_handle.num_peers);
+
+    let args: RequestVoteArgs = RequestVoteArgs {
+        term,
+        candidate_id: rf_handle.me,
+        last_log_index,
+        last_log_term,
+    };
+    let timeout = Raft::generate_election_timeout();
+    let net = net::NetLocalHandle::current();
+
+    let mut rpcs = FuturesUnordered::new();
+    for (i, &peer) in rf_handle.peers.iter().enumerate() {
+        if i == rf_handle.me {
+            continue;
+        }
+        // NOTE: `call` function takes ownerships
+        let net = net.clone();
+        let args = args.clone();
+        rpcs.push(async move {
+            net.call_timeout::<RequestVoteArgs, RequestVoteReply>(peer, args, timeout)
+                .await
+        });
+    }
+
+    // spawn a concurrent task
+    let mut tx = tx.clone();
+    task::spawn(async move {
+        // handle RPC tasks in completion order
+        while let Some(res) = rpcs.next().await {
+            let rf = rf_handle.inner.lock().unwrap();
+            match res {
+                Ok(reply) => {
+                    if reply.term > rf.current_term {
+                        let _ = tx.try_send(VoteResult::HigherTerm(reply.term));
+                    } else if term == rf.current_term && reply.vote_granted {
+                        let _ = tx.try_send(VoteResult::Granted);
+                    } else {
+                        let _ = tx.try_send(VoteResult::Denied);
+                    }
+                }
+                Err(e) => {
+                    if term == rf.current_term {
+                        let _ = tx.try_send(VoteResult::Denied);
+                    }
+                }
+            }
+        }
+    }).detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
+
+    rx
+}
+
+fn send_heartbeat(rf_handle: RaftHandle, term: u64) {
+    let args: AppendEntriesArgs = AppendEntriesArgs {
+        term,
+        leader_id: rf_handle.me,
+    };
+    let timeout = Raft::generate_election_timeout();
+    let net = net::NetLocalHandle::current();
+    let mut rpcs = FuturesUnordered::new();
+    for (i, &peer) in rf_handle.peers.iter().enumerate() {
+        if i == rf_handle.me {
+            continue;
+        }
+        let net = net.clone();
+        let args = args.clone();
+        rpcs.push(async move {
+            net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout).await
+        });
+    }
+
+    task::spawn(async move {
+        while let Some(res) = rpcs.next().await {
+            let mut rf = rf_handle.inner.lock().unwrap();
+            match res {
+                Ok(reply) => {
+                    if reply.term > rf.current_term {
+                        rf.current_term = reply.term;
+                        rf.role = Role::Follower;
+                        rf.voted_for = None;
+                    }
+                }
+                Err(e) => {}
+            }
+        }
+    }).detach();
+}
+
+
 // HINT: put mutable non-async functions here
 impl Raft {
     fn start(&mut self, data: &[u8]) -> Result<Start> {
-        if !self.state.is_leader() {
-            let leader = (self.me + 1) % self.peers.len();
-            return Err(Error::NotLeader(leader));
-        }
-        todo!("start agreement");
+        let leader = (self.me + 1) % self.peers.len();
+        Err(Error::NotLeader(leader))
     }
 
     // Here is an example to apply committed message.
@@ -253,7 +454,46 @@ impl Raft {
     }
 
     fn request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
-        todo!("handle RequestVote RPC");
+        if args.term > self.current_term {
+            self.current_term = args.term;
+            self.role = Role::Follower;
+            self.voted_for = None;
+        }
+        if args.term < self.current_term {
+            return RequestVoteReply {
+                term: self.current_term,
+                vote_granted: false,
+            }
+        }
+        let mut vote_granted = false;
+        if self.voted_for.is_none() || self.voted_for == Some(args.candidate_id) {
+            self.voted_for = Some(args.candidate_id);
+            vote_granted = true;
+        }
+        if vote_granted {
+            self.received_valid_rpc = true;
+        }
+        RequestVoteReply {
+            term: self.current_term,
+            vote_granted
+        }
+    }
+
+    fn append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+        if args.term > self.current_term {
+            self.current_term = args.term;
+            self.role = Role::Follower;
+            self.voted_for = None;
+        }
+        if args.term < self.current_term {
+            return AppendEntriesReply {
+                term: self.current_term, success: false
+            }
+        }
+        self.received_valid_rpc = true;
+        AppendEntriesReply {
+            term: self.current_term, success: true
+        }
     }
 
     // Here is an example to generate random number.
@@ -261,44 +501,34 @@ impl Raft {
         // see rand crate for more details
         Duration::from_millis(rand::rng().gen_range(150..300))
     }
-
-    // Here is an example to send RPC and manage concurrent tasks.
-    fn send_vote_request(&mut self) {
-        let args: RequestVoteArgs = todo!("construct RPC request");
-        let timeout = Self::generate_election_timeout();
-        let net = net::NetLocalHandle::current();
-
-        let mut rpcs = FuturesUnordered::new();
-        for (i, &peer) in self.peers.iter().enumerate() {
-            if i == self.me {
-                continue;
-            }
-            // NOTE: `call` function takes ownerships
-            let net = net.clone();
-            let args = args.clone();
-            rpcs.push(async move {
-                net.call_timeout::<RequestVoteArgs, RequestVoteReply>(peer, args, timeout)
-                    .await
-            });
-        }
-
-        // spawn a concurrent task
-        task::spawn(async move {
-            // handle RPC tasks in completion order
-            while let Some(res) = rpcs.next().await {
-                todo!("handle RPC results");
-            }
-        })
-        .detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestVoteArgs {
     // Your data here.
+    term: u64,
+    candidate_id: usize,
+    last_log_index: u64,
+    last_log_term: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestVoteReply {
     // Your data here.
+    term: u64,
+    vote_granted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppendEntriesArgs {
+    // Your data here.
+    term: u64,
+    leader_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppendEntriesReply {
+    // Your data here.
+    term: u64,
+    success: bool,
 }
