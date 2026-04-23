@@ -11,6 +11,8 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+use std::fmt::{Debug, Formatter};
+
 
 #[derive(Clone)]
 pub struct RaftHandle {
@@ -73,10 +75,33 @@ struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
-    role: Role,
+
+    // persistent state on all servers
     current_term: u64,
-    received_valid_rpc: bool,
     voted_for: Option<usize>,
+    log: Vec<LogEntry>,
+
+    // volatile state on all servers
+    commit_index: usize,
+    last_applied: usize,
+    role: Role,
+    received_valid_rpc: bool,
+
+    // volatile state on leaders
+    next_index: Vec<usize>,
+    match_index: Vec<usize>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LogEntry {
+    term: u64,
+    command: Vec<u8>,
+}
+
+impl Debug for LogEntry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.term)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,14 +134,24 @@ impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let (apply_ch, recver) = mpsc::unbounded();
         let num_peers = peers.len();
+        let mut log: Vec<LogEntry> = Vec::new();
+        log.push(LogEntry {
+            term: 0,
+            command: Vec::new(),
+        });
         let inner = Arc::new(Mutex::new(Raft {
             peers: peers.clone(),
             me,
             apply_ch,
-            role: Role::Follower,
             current_term: 0,
-            received_valid_rpc: false,
             voted_for: None,
+            log,
+            commit_index: 0,
+            last_applied: 0,
+            role: Role::Follower,
+            received_valid_rpc: false,
+            next_index: Vec::new(),
+            match_index: Vec::new(),
         }));
         let handle = RaftHandle {peers, inner, me, num_peers, num_half_vote: (num_peers + 1) / 2 };
         // initialize from state persisted before a crash
@@ -126,6 +161,11 @@ impl RaftHandle {
         let handle_clone = handle.clone();
         task::spawn( async move {
             background(handle_clone).await;
+        }).detach();
+
+        let handle_clone = handle.clone();
+        task::spawn(async move {
+            commit_entries(handle_clone).await;
         }).detach();
 
 
@@ -141,7 +181,7 @@ impl RaftHandle {
     /// Raft log, since the leader may fail or lose an election.
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
         let mut raft = self.inner.lock().unwrap();
-        info!("{:?} start", *raft);
+        // info!("{:?} start", *raft);
         raft.start(cmd)
     }
 
@@ -255,6 +295,21 @@ impl RaftHandle {
     }
 }
 
+async fn commit_entries(rf_handle: RaftHandle) {
+    loop {
+        sleep(Duration::from_millis(300)).await;
+        let mut rf = rf_handle.inner.lock().unwrap();
+        loop {
+            if rf.commit_index > rf.last_applied {
+                rf.last_applied += 1;
+                rf.apply(rf.log[rf.last_applied].command.clone(), rf.last_applied as u64);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 async fn background(rf_handle: RaftHandle) {
     loop {
         let role= {
@@ -280,7 +335,30 @@ async fn leader_task(rf_handle: RaftHandle) {
     if rf.role != Role::Leader {
         return;
     }
-    send_heartbeat(rf_handle.clone(), rf.current_term);
+    let mut new_commit_index = rf.commit_index;
+    for n in rf.commit_index + 1..rf.log.len() {
+        if rf.log[n].term != rf.current_term {
+            continue; // term mismatch, but a later entry might still qualify
+        }
+        if rf.match_index.iter().filter(|&&m| m >= n).count() >= rf_handle.num_half_vote {
+            new_commit_index = n; // keep going, there may be a higher valid N
+        }
+    }
+    rf.commit_index = new_commit_index;
+    for i in 0..rf_handle.num_peers {
+        if i == rf_handle.me {
+            continue;
+        }
+        let prev_log_index = rf.next_index[i] - 1;
+        if rf.log.len() - 1 >= rf.next_index[i] {
+            let entries_copy = rf.log[rf.next_index[i]..].to_vec();
+            send_append_entries(rf_handle.clone(), i, rf.current_term, prev_log_index,
+                                rf.log[prev_log_index].term, rf.commit_index, entries_copy);
+        } else {
+            send_append_entries(rf_handle.clone(), i, rf.current_term, prev_log_index,
+                                rf.log[prev_log_index].term, rf.commit_index, Vec::new());
+        }
+    }
 }
 
 async fn follower_task(rf_handle: RaftHandle, initial_role: Role) {
@@ -299,8 +377,8 @@ async fn follower_task(rf_handle: RaftHandle, initial_role: Role) {
         rf.current_term += 1;
         rf.voted_for = Some(rf.me);
         let term = rf.current_term;
-        info!("[{term}] peer {0} begin election", rf_handle.me);
-        begin_election(rf_handle.clone(), term, 0, 0)
+        // info!("[{term}] peer {0} begin election", rf_handle.me);
+        begin_election(rf_handle.clone(), term, rf.log.len()-1, rf.log[rf.log.len()-1].term)
     };
 
     let mut num_granted = 1;
@@ -336,7 +414,16 @@ async fn follower_task(rf_handle: RaftHandle, initial_role: Role) {
         if num_granted >= rf_handle.num_half_vote {
             info!("[{}] peer {} becomes leader", rf.current_term, rf.me);
             rf.role = Role::Leader;
-            send_heartbeat(rf_handle.clone(), rf.current_term);
+            rf.next_index = vec![rf.log.len(); rf_handle.num_peers];
+            rf.match_index = vec![0; rf_handle.num_peers];
+            rf.match_index[rf_handle.me] = rf.log.len() - 1;
+            for i in 0..rf_handle.num_peers {
+                if i == rf_handle.me {
+                    continue;
+                }
+                send_append_entries(rf_handle.clone(), i, rf.current_term,
+                                    rf.log.len()-1, rf.log[rf.log.len()-1].term, rf.commit_index, Vec::new());
+            }
             return;
         }
         if num_voted >= rf_handle.num_peers {
@@ -345,7 +432,7 @@ async fn follower_task(rf_handle: RaftHandle, initial_role: Role) {
     }
 }
 
-fn begin_election(rf_handle: RaftHandle, term: u64, last_log_index: u64, last_log_term: u64)
+fn begin_election(rf_handle: RaftHandle, term: u64, last_log_index: usize, last_log_term: u64)
     -> mpsc::Receiver<VoteResult> {
     let (tx, rx) = mpsc::channel(rf_handle.num_peers);
 
@@ -378,6 +465,7 @@ fn begin_election(rf_handle: RaftHandle, term: u64, last_log_index: u64, last_lo
         // handle RPC tasks in completion order
         while let Some(res) = rpcs.next().await {
             let rf = rf_handle.inner.lock().unwrap();
+            // info!("[{}] peer {} received reply {:?}", rf.current_term, rf.me, res);
             match res {
                 Ok(reply) => {
                     if reply.term > rf.current_term {
@@ -400,24 +488,25 @@ fn begin_election(rf_handle: RaftHandle, term: u64, last_log_index: u64, last_lo
     rx
 }
 
-fn send_heartbeat(rf_handle: RaftHandle, term: u64) {
+fn send_append_entries(rf_handle: RaftHandle, peer_index: usize, term: u64, prev_log_index: usize,
+                       prev_log_term: u64, leader_commit: usize, entries: Vec<LogEntry>) {
     let args: AppendEntriesArgs = AppendEntriesArgs {
         term,
         leader_id: rf_handle.me,
+        prev_log_index,
+        prev_log_term,
+        entries: entries.clone(),
+        leader_commit,
     };
     let timeout = Raft::generate_election_timeout();
     let net = net::NetLocalHandle::current();
     let mut rpcs = FuturesUnordered::new();
-    for (i, &peer) in rf_handle.peers.iter().enumerate() {
-        if i == rf_handle.me {
-            continue;
-        }
-        let net = net.clone();
-        let args = args.clone();
-        rpcs.push(async move {
-            net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout).await
-        });
-    }
+    let peer = rf_handle.peers[peer_index].clone();
+    let net = net.clone();
+    let args = args.clone();
+    rpcs.push(async move {
+        net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout).await
+    });
 
     task::spawn(async move {
         while let Some(res) = rpcs.next().await {
@@ -428,6 +517,37 @@ fn send_heartbeat(rf_handle: RaftHandle, term: u64) {
                         rf.current_term = reply.term;
                         rf.role = Role::Follower;
                         rf.voted_for = None;
+                    }
+                    if reply.success {
+                        let new_match_index = prev_log_index + entries.len();
+                        assert!(
+                            new_match_index >= rf.match_index[peer_index],
+                            "match_index[{}] would go backwards {} -> {}",
+                            peer_index, rf.match_index[peer_index], new_match_index
+                        );
+                        rf.next_index[peer_index] = new_match_index + 1;
+                        rf.match_index[peer_index] = new_match_index;
+                    } else if reply.term == term {
+                        if reply.xterm.is_none() {
+                            // Follower log too short — jump directly to its length
+                            rf.next_index[peer_index] = reply.xindex.expect("xindex must be set when xterm is None");
+                        } else {
+                            // Find last entry in leader's log with xterm
+                            let x_term = reply.xterm.unwrap();
+                            let found = (1..rf.log.len()).rev().find(|&j| rf.log[j].term == x_term);
+                            rf.next_index[peer_index] = match found {
+                                // Leader has xterm: start after its last entry
+                                Some(j) => j + 1,
+                                // Leader doesn't have xterm: jump to first conflicting index
+                                None => reply.xindex.expect("xindex must be set when xterm is set"),
+                            };
+                        }
+                        rf.next_index[peer_index] = rf.next_index[peer_index].max(1);
+                        assert!(
+                            rf.next_index[peer_index] >= 1,
+                            "next_index[{}] = {} < 1 after backtrack",
+                            peer_index, rf.next_index[peer_index]
+                        );
                     }
                 }
                 Err(e) => {}
@@ -440,20 +560,36 @@ fn send_heartbeat(rf_handle: RaftHandle, term: u64) {
 // HINT: put mutable non-async functions here
 impl Raft {
     fn start(&mut self, data: &[u8]) -> Result<Start> {
-        let leader = (self.me + 1) % self.peers.len();
-        Err(Error::NotLeader(leader))
+        if self.role != Role::Leader {
+            let leader = (self.me + 1) % self.peers.len();
+            return Err(Error::NotLeader(leader));
+        }
+        self.log.push(LogEntry{
+            term: self.current_term,
+            command: data.to_vec(),
+        });
+        self.next_index[self.me] += 1;
+        self.match_index[self.me] = self.log.len() - 1;
+
+        Ok(Start {
+            index: (self.log.len() - 1) as u64,
+            term: self.current_term,
+        })
     }
 
     // Here is an example to apply committed message.
-    fn apply(&self) {
+    fn apply(&self, data: Vec<u8>, index: u64) {
+        info!("[{}] peer {} apply with index {}", self.current_term, self.me, index);
         let msg = ApplyMsg::Command {
-            data: todo!("apply msg"),
-            index: todo!("apply msg"),
+            data,
+            index,
         };
         self.apply_ch.unbounded_send(msg).unwrap();
     }
 
     fn request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+        // info!("[{}] peer {} received {:?}, current vote for {:?}",
+        // self.current_term, self.me, args, self.voted_for);
         if args.term > self.current_term {
             self.current_term = args.term;
             self.role = Role::Follower;
@@ -465,34 +601,115 @@ impl Raft {
                 vote_granted: false,
             }
         }
-        let mut vote_granted = false;
-        if self.voted_for.is_none() || self.voted_for == Some(args.candidate_id) {
+        let candidate_up_to_date = {
+            if args.last_log_term != self.log[self.log.len() - 1].term {
+                args.last_log_term >= self.log[self.log.len() - 1].term
+            } else {
+                args.last_log_index >= (self.log.len() - 1)
+            }
+        };
+        if (self.voted_for.is_none() || self.voted_for == Some(args.candidate_id))
+            && candidate_up_to_date {
             self.voted_for = Some(args.candidate_id);
-            vote_granted = true;
-        }
-        if vote_granted {
             self.received_valid_rpc = true;
+            return RequestVoteReply {
+                    term: self.current_term,
+                    vote_granted: true,
+            }
         }
         RequestVoteReply {
             term: self.current_term,
-            vote_granted
+            vote_granted: false,
         }
     }
 
     fn append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+        info!("[{}] peer {} received {:?}", self.current_term, self.me, args);
+        info!("[{}] peer {} log {:?}", self.current_term, self.me, self.log);
         if args.term > self.current_term {
             self.current_term = args.term;
             self.role = Role::Follower;
             self.voted_for = None;
         }
+
         if args.term < self.current_term {
             return AppendEntriesReply {
-                term: self.current_term, success: false
+                term: self.current_term,
+                success: false,
+                xindex: None,
+                xterm: None,
+            };
+        }
+
+        if args.prev_log_index >= self.log.len() {
+            return AppendEntriesReply {
+                term: self.current_term,
+                success: false,
+                xindex: Some(self.log.len()),
+                xterm: None,
+            };
+        }
+
+        if self.log[args.prev_log_index].term != args.prev_log_term {
+            let x_term = self.log[args.prev_log_index].term;
+            let mut x_index = args.prev_log_index;
+            while x_index > 0 && self.log[x_index - 1].term == x_term {
+                x_index -= 1;
+            }
+            return AppendEntriesReply {
+                term: self.current_term,
+                success: false,
+                xterm: Some(x_term),
+                xindex: Some(x_index),
+            };
+        }
+
+        // Steps 3 & 4: reconcile incoming entries with existing log
+        for (i, entry) in args.entries.iter().enumerate() {
+            let log_index = args.prev_log_index + 1 + i;
+            if log_index < self.log.len() {
+                if self.log[log_index].term != entry.term {
+                    assert!(
+                        log_index > self.commit_index,
+                        "truncating log at index {} which is <= commit_index {} — would destroy committed entry",
+                        log_index, self.commit_index
+                    );
+                    self.log.truncate(log_index);
+                    self.log.extend_from_slice(&args.entries[i..]);
+                    break;
+                }
+                // Entry already matches, keep scanning
+            } else {
+                // Past the end of our log — append remaining entries all at once
+                self.log.extend_from_slice(&args.entries[i..]);
+                break;
             }
         }
+
+        // Step 5: advance commitIndex (must never go backwards)
+        if args.leader_commit > self.commit_index {
+            let prev_commit_index = self.commit_index;
+            let last_new_entry_index = args.prev_log_index + args.entries.len();
+            self.commit_index = args.leader_commit.min(last_new_entry_index);
+            assert!(
+                self.commit_index >= prev_commit_index,
+                "commit_index went backwards {} -> {}",
+                prev_commit_index, self.commit_index
+            );
+            assert!(
+                self.commit_index < self.log.len(),
+                "commit_index {} >= log.len() {} after AE update",
+                self.commit_index, self.log.len()
+            );
+        }
+
         self.received_valid_rpc = true;
+
         AppendEntriesReply {
-            term: self.current_term, success: true
+            term: self.current_term,
+            success: true,
+            xindex: None,
+            xterm: None,
         }
     }
 
@@ -508,7 +725,7 @@ struct RequestVoteArgs {
     // Your data here.
     term: u64,
     candidate_id: usize,
-    last_log_index: u64,
+    last_log_index: usize,
     last_log_term: u64,
 }
 
@@ -524,6 +741,10 @@ struct AppendEntriesArgs {
     // Your data here.
     term: u64,
     leader_id: usize,
+    prev_log_index: usize,
+    prev_log_term: u64,
+    entries: Vec<LogEntry>,
+    leader_commit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,4 +752,6 @@ struct AppendEntriesReply {
     // Your data here.
     term: u64,
     success: bool,
+    xterm: Option<u64>,
+    xindex: Option<usize>,
 }
