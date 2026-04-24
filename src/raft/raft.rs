@@ -13,6 +13,11 @@ use std::{
 };
 use std::fmt::{Debug, Formatter};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MyEntry {
+    pub x: u64,
+}
+
 
 #[derive(Clone)]
 pub struct RaftHandle {
@@ -121,6 +126,9 @@ impl Default for Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Persist {
     // Your data here.
+    current_term: u64,
+    voted_for: Option<usize>,
+    log: Vec<LogEntry>,
 }
 
 impl fmt::Debug for Raft {
@@ -168,6 +176,10 @@ impl RaftHandle {
             commit_entries(handle_clone).await;
         }).detach();
 
+        {
+            let rf = handle.inner.lock().unwrap();
+            info!("[{}] peer {} new {:?} {:?}", rf.current_term, rf.me, rf.voted_for, rf.log);
+        }
 
         (handle, recver)
     }
@@ -180,9 +192,15 @@ impl RaftHandle {
     /// There is no guarantee that this command will ever be committed to the
     /// Raft log, since the leader may fail or lose an election.
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
-        let mut raft = self.inner.lock().unwrap();
-        // info!("{:?} start", *raft);
-        raft.start(cmd)
+        let result = {
+            let mut raft = self.inner.lock().unwrap();
+            // info!("{:?} start", *raft);
+            raft.start(cmd)
+        };
+        if result.is_ok() {
+            self.persist().await.expect("failed to persist");
+        }
+        result
     }
 
     /// The current term of this peer.
@@ -220,8 +238,14 @@ impl RaftHandle {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     async fn persist(&self) -> io::Result<()> {
-        let persist: Persist = todo!("persist state");
-        let snapshot: Vec<u8> = todo!("persist snapshot");
+        let persist: Persist = {
+            let rf = self.inner.lock().unwrap();
+            Persist {
+            current_term: rf.current_term,
+            voted_for: rf.voted_for,
+            log: rf.log.clone(),
+        }};
+        // let snapshot: Vec<u8> = todo!("persist snapshot");
         let state = bincode::serialize(&persist).unwrap();
 
         // you need to store persistent state in file "state"
@@ -233,25 +257,28 @@ impl RaftHandle {
         // otherwise data will be lost on power fail.
         file.sync_all().await?;
 
-        let file = fs::File::create("snapshot").await?;
-        file.write_all_at(&snapshot, 0).await?;
-        file.sync_all().await?;
+        // let file = fs::File::create("snapshot").await?;
+        // file.write_all_at(&snapshot, 0).await?;
+        // file.sync_all().await?;
         Ok(())
     }
 
     /// Restore previously persisted state.
     async fn restore(&self) -> io::Result<()> {
-        match fs::read("snapshot").await {
-            Ok(snapshot) => {
-                todo!("restore snapshot");
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+        // match fs::read("snapshot").await {
+        //     Ok(snapshot) => {
+        //         todo!("restore snapshot");
+        //     }
+        //     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        //     Err(e) => return Err(e),
+        // }
         match fs::read("state").await {
             Ok(state) => {
                 let persist: Persist = bincode::deserialize(&state).unwrap();
-                todo!("restore state");
+                let mut rf = self.inner.lock().unwrap();
+                rf.current_term = persist.current_term;
+                rf.voted_for = persist.voted_for;
+                rf.log = persist.log.clone();
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -282,7 +309,7 @@ impl RaftHandle {
         };
         // if you need to persist or call async functions here,
         // make sure the lock is scoped and dropped.
-        // self.persist().await.expect("failed to persist");
+        self.persist().await.expect("failed to persist");
         Ok(reply)
     }
 
@@ -291,6 +318,7 @@ impl RaftHandle {
             let mut this = self.inner.lock().unwrap();
             this.append_entries(args)
         };
+        self.persist().await.expect("failed to persist");
         Ok(reply)
     }
 }
@@ -383,53 +411,60 @@ async fn follower_task(rf_handle: RaftHandle, initial_role: Role) {
 
     let mut num_granted = 1;
     let mut num_voted = 1;
+    let mut break_flag = false;
     while let Some(result) = rx.next().await {
-        let mut rf = rf_handle.inner.lock().unwrap();
-        match result {
-            VoteResult::HigherTerm(term) => {
-                num_granted = 0;
-                num_voted = rf_handle.num_peers;
+        {
+            let mut rf = rf_handle.inner.lock().unwrap();
+            match result {
+                VoteResult::HigherTerm(term) => {
+                    num_granted = 0;
+                    num_voted = rf_handle.num_peers;
+                    rf.role = Role::Follower;
+                    if term > rf.current_term {
+                        rf.current_term = term;
+                        rf.voted_for = None;
+                    }
+                }
+                VoteResult::Granted => {
+                    num_granted += 1;
+                    num_voted += 1;
+                }
+                VoteResult::Denied => {
+                    num_voted += 1;
+                }
+            }
+            if !break_flag && rf.received_valid_rpc {
+                rf.received_valid_rpc = false;
                 rf.role = Role::Follower;
-                if term > rf.current_term {
-                    rf.current_term = term;
-                    rf.voted_for = None;
+                break_flag = true;
+            }
+            if !break_flag && rf.role != Role::Candidate {
+                break_flag = true;
+            }
+            if !break_flag && num_granted >= rf_handle.num_half_vote {
+                info!("[{}] peer {} becomes leader", rf.current_term, rf.me);
+                rf.role = Role::Leader;
+                rf.next_index = vec![rf.log.len(); rf_handle.num_peers];
+                rf.match_index = vec![0; rf_handle.num_peers];
+                rf.match_index[rf_handle.me] = rf.log.len() - 1;
+                for i in 0..rf_handle.num_peers {
+                    if i == rf_handle.me {
+                        continue;
+                    }
+                    send_append_entries(rf_handle.clone(), i, rf.current_term,
+                                        rf.log.len() - 1, rf.log[rf.log.len() - 1].term, rf.commit_index, Vec::new());
                 }
+                break_flag = true;
             }
-            VoteResult::Granted => {
-                num_granted += 1;
-                num_voted += 1;
-            }
-            VoteResult::Denied => {
-                num_voted += 1;
+            if !break_flag && num_voted >= rf_handle.num_peers {
+                break_flag = true;
             }
         }
-        if rf.received_valid_rpc {
-            rf.received_valid_rpc = false;
-            rf.role = Role::Follower;
-            return;
-        }
-        if rf.role != Role::Candidate {
-            return;
-        }
-        if num_granted >= rf_handle.num_half_vote {
-            info!("[{}] peer {} becomes leader", rf.current_term, rf.me);
-            rf.role = Role::Leader;
-            rf.next_index = vec![rf.log.len(); rf_handle.num_peers];
-            rf.match_index = vec![0; rf_handle.num_peers];
-            rf.match_index[rf_handle.me] = rf.log.len() - 1;
-            for i in 0..rf_handle.num_peers {
-                if i == rf_handle.me {
-                    continue;
-                }
-                send_append_entries(rf_handle.clone(), i, rf.current_term,
-                                    rf.log.len()-1, rf.log[rf.log.len()-1].term, rf.commit_index, Vec::new());
-            }
-            return;
-        }
-        if num_voted >= rf_handle.num_peers {
-            return
+        if break_flag {
+            break;
         }
     }
+    rf_handle.persist().await.expect("failed to persist");
 }
 
 fn begin_election(rf_handle: RaftHandle, term: u64, last_log_index: usize, last_log_term: u64)
@@ -498,60 +533,64 @@ fn send_append_entries(rf_handle: RaftHandle, peer_index: usize, term: u64, prev
         entries: entries.clone(),
         leader_commit,
     };
+    info!("[{}] peer {} send to peer {} {:?}", term, rf_handle.me, peer_index, args);
     let timeout = Raft::generate_election_timeout();
     let net = net::NetLocalHandle::current();
     let mut rpcs = FuturesUnordered::new();
     let peer = rf_handle.peers[peer_index].clone();
     let net = net.clone();
-    let args = args.clone();
+    let args_clone = args.clone();
     rpcs.push(async move {
-        net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout).await
+        net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args_clone, timeout).await
     });
 
     task::spawn(async move {
         while let Some(res) = rpcs.next().await {
-            let mut rf = rf_handle.inner.lock().unwrap();
-            match res {
-                Ok(reply) => {
-                    if reply.term > rf.current_term {
-                        rf.current_term = reply.term;
-                        rf.role = Role::Follower;
-                        rf.voted_for = None;
-                    }
-                    if reply.success {
-                        let new_match_index = prev_log_index + entries.len();
-                        assert!(
-                            new_match_index >= rf.match_index[peer_index],
-                            "match_index[{}] would go backwards {} -> {}",
-                            peer_index, rf.match_index[peer_index], new_match_index
-                        );
-                        rf.next_index[peer_index] = new_match_index + 1;
-                        rf.match_index[peer_index] = new_match_index;
-                    } else if reply.term == term {
-                        if reply.xterm.is_none() {
-                            // Follower log too short — jump directly to its length
-                            rf.next_index[peer_index] = reply.xindex.expect("xindex must be set when xterm is None");
-                        } else {
-                            // Find last entry in leader's log with xterm
-                            let x_term = reply.xterm.unwrap();
-                            let found = (1..rf.log.len()).rev().find(|&j| rf.log[j].term == x_term);
-                            rf.next_index[peer_index] = match found {
-                                // Leader has xterm: start after its last entry
-                                Some(j) => j + 1,
-                                // Leader doesn't have xterm: jump to first conflicting index
-                                None => reply.xindex.expect("xindex must be set when xterm is set"),
-                            };
+            {
+                let mut rf = rf_handle.inner.lock().unwrap();
+                match res {
+                    Ok(reply) => {
+                        if reply.term > rf.current_term {
+                            rf.current_term = reply.term;
+                            rf.role = Role::Follower;
+                            rf.voted_for = None;
                         }
-                        rf.next_index[peer_index] = rf.next_index[peer_index].max(1);
-                        assert!(
-                            rf.next_index[peer_index] >= 1,
-                            "next_index[{}] = {} < 1 after backtrack",
-                            peer_index, rf.next_index[peer_index]
-                        );
+                        if reply.success {
+                            // info!("[{}] peer {} received success from peer {}, {:?}", rf.current_term,
+                            // rf.me, peer_index, args);
+                            let new_match_index = prev_log_index + entries.len();
+                            if new_match_index > rf.match_index[peer_index] {
+                                rf.next_index[peer_index] = new_match_index + 1;
+                                rf.match_index[peer_index] = new_match_index;
+                            }
+                            // info!("[{}] peer {} update match_index[{}] to {}", rf.current_term, rf.me, peer_index, new_match_index);
+                        } else if reply.term == term {
+                            if reply.xterm.is_none() {
+                                // Follower log too short — jump directly to its length
+                                rf.next_index[peer_index] = reply.xindex.expect("xindex must be set when xterm is None");
+                            } else {
+                                // Find last entry in leader's log with xterm
+                                let x_term = reply.xterm.unwrap();
+                                let found = (1..rf.log.len()).rev().find(|&j| rf.log[j].term == x_term);
+                                rf.next_index[peer_index] = match found {
+                                    // Leader has xterm: start after its last entry
+                                    Some(j) => j + 1,
+                                    // Leader doesn't have xterm: jump to first conflicting index
+                                    None => reply.xindex.expect("xindex must be set when xterm is set"),
+                                };
+                            }
+                            rf.next_index[peer_index] = rf.next_index[peer_index].max(1);
+                            assert!(
+                                rf.next_index[peer_index] >= 1,
+                                "next_index[{}] = {} < 1 after backtrack",
+                                peer_index, rf.next_index[peer_index]
+                            );
+                        }
                     }
+                    Err(e) => {}
                 }
-                Err(e) => {}
             }
+            rf_handle.persist().await.expect("failed to persist");
         }
     }).detach();
 }
@@ -579,7 +618,8 @@ impl Raft {
 
     // Here is an example to apply committed message.
     fn apply(&self, data: Vec<u8>, index: u64) {
-        info!("[{}] peer {} apply with index {}", self.current_term, self.me, index);
+        let entry: MyEntry = bincode::deserialize(&data).unwrap();
+        info!("[{}] peer {} apply {} with index {}", self.current_term, self.me, entry.x , index);
         let msg = ApplyMsg::Command {
             data,
             index,
@@ -624,8 +664,8 @@ impl Raft {
     }
 
     fn append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
-        info!("[{}] peer {} received {:?}", self.current_term, self.me, args);
-        info!("[{}] peer {} log {:?}", self.current_term, self.me, self.log);
+        // info!("[{}] peer {} received {:?}", self.current_term, self.me, args);
+        // info!("[{}] peer {} log {:?}", self.current_term, self.me, self.log);
         if args.term > self.current_term {
             self.current_term = args.term;
             self.role = Role::Follower;
@@ -640,6 +680,11 @@ impl Raft {
                 xterm: None,
             };
         }
+
+        // Reset election timer for any valid-term AppendEntries, even if log check fails.
+        // Without this, a follower won't reset its timer while the leader backtracks,
+        // causing spurious elections that keep resetting next_index and preventing convergence.
+        self.received_valid_rpc = true;
 
         if args.prev_log_index >= self.log.len() {
             return AppendEntriesReply {
@@ -702,8 +747,6 @@ impl Raft {
                 self.commit_index, self.log.len()
             );
         }
-
-        self.received_valid_rpc = true;
 
         AppendEntriesReply {
             term: self.current_term,
